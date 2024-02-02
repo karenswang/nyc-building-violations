@@ -28,6 +28,9 @@ library(reticulate)
 
 ```
 
+My set of questions:
+How is the number of building violations related to the median income, racial composition, poverty rate, education level, sale price of the building in New York City? I also included occupacy rate in the analysis in case it is related to the violation count (but not to my questions).
+
 ```{r}
 
 census_api_key("f6ffa5623337368ebcb951559878807df65f76ea")
