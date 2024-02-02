@@ -1,0 +1,170 @@
+```{python}
+import pandas as pd
+
+# building maintenance violation data after 2017
+building_violations = pd.read_csv("./data/building_violation_after_2017.csv")
+# those that are impairing to health and safety
+building_violations_impairing = pd.read_csv("./data/building_violation_after_2017_impairing.csv")
+```
+
+```{python}
+sales = pd.read_csv("./data/building_sales.csv")
+sales.head()
+```
+
+
+```{python}
+# group by census tract and count the number of violations
+violation_count = building_violations.groupby("CensusTract").size().reset_index(name="count")
+violation_impairing_count = building_violations_impairing.groupby("CensusTract").size().reset_index(name="count")
+```
+
+
+
+```{r}
+library(tidyverse)
+library(tidycensus)
+library(reticulate)
+
+```
+
+```{r}
+
+census_api_key("f6ffa5623337368ebcb951559878807df65f76ea")
+# Sys.getenv("CENSUS_API_KEY")
+#get ACS data
+nyc_tract_data <- get_acs(geography = "tract", 
+                            state = "NY",
+                            county = "new york", 
+                            variables = c(
+                                med_inc = "B19013_001",
+                                white = "B02001_002", 
+                                black = "B02001_003", 
+                                poverty = "B17001_002",
+                                education_high_school = "B15003_017",
+                                education_bachelor = "B15003_022",
+                                occupancy = "B25002_002"
+                            , year = 2021),
+                            summary_var = "B01003_001"
+                                                 ) %>% 
+    select(-moe, -summary_moe) %>% 
+    pivot_wider(names_from = "variable", values_from = "estimate") %>% 
+    mutate(black_perc = black / summary_est,
+                    white_perc = white / summary_est,
+                 pov_perc = poverty / summary_est,
+                 high_school_perc = education_high_school / summary_est,
+                 bach_perc = education_bachelor / summary_est,
+                 occupancy_perc = occupancy / summary_est,
+                 CensusTract = as.numeric(str_extract(NAME, "\\d+(\\.\\d+)?"))
+                 )
+                
+
+# nyc_tract_data_py<-r_to_py(nyc_tract_data)
+
+```
+
+```{r}
+# census_api_key("f6ffa5623337368ebcb951559878807df65f76ea")
+# nyc_census <- get_decennial(geography = "tract", 
+#                             state = "NY",
+#                             county = "new york", 
+#                             variables = c(
+#                                 education = "C15003_001",
+#                                 year = 2020),
+#                             summary_var = "P001001"
+#                                                  )  %>%
+#     mutate(edu_perc = education / summary_var,
+#     CensusTract = as.numeric(str_extract(NAME, "\\d+(\\.\\d+)?")))
+
+```
+
+```{python}
+pop = pd.DataFrame(r.nyc_tract_data)
+pop.head()
+pop.columns
+```
+
+```{r}
+library(reticulate)
+
+# Join the dataframes on the "CensusTract" column
+joined_pop <- merge(py$violation_count, py$pop, by = "CensusTract")
+joined_pop_impairing <- merge(py$violation_impairing_count, py$pop, by = "CensusTract")
+
+# Join the sales dataframe
+joined_pop <- merge(joined_pop, py$sales, by.x = "CensusTract", by.y = "Census Tract 2020")
+joined_pop_impairing <- merge(joined_pop_impairing, py$sales, by.x = "CensusTract", by.y = "Census Tract 2020")
+
+# Create a linear model
+mod <- lm(count ~ med_inc + black_perc + white_perc + pov_perc + high_school_perc + bach_perc + occupancy_perc + `SALE PRICE`, data = joined_pop)
+
+mod_impairing <- lm(count ~ med_inc + black_perc + white_perc + pov_perc + high_school_perc + bach_perc + occupancy_perc + `SALE PRICE`, data = joined_pop_impairing)
+
+# Plot model for violations against multivariate
+par(mfrow=c(2,2))
+plot(mod)
+```
+
+The residuals v. fitted plot and Q-Q plot are okay. But the scale-location plot isn't ideal. And there are notible outliers on the leverage plot. 
+
+```{r}
+plot model for impairing violations against multivariate
+plot(mod_impairing)
+```
+
+Very similar diagnostic plots for impairing data. 
+
+```{r}
+options(scipen = 999)
+summary(mod)
+```
+
+The only significant variable is the median income. It has a negative coefficient (and low p value), which means that as median income increases, the number of violations decreases. This is not surprising. Sales price of buildings also have a negative coefficient, but it is not significant. All other variables have a relatively large standard error. But notibly, the poverty rate has a very big estimate -19342 compared to its standard error 5111. 
+
+```{r}
+options(scipen = 999)
+summary(mod_impairing)
+```
+
+Similar patterns for the impairing data, except that the magnitude of the coefficients and errors are smaller. 
+
+From linear models, the only considerable variable is median income, and potentially poverty rate.
+
+```{r}
+# Create a Poisson model
+mod_pois <- glm(count ~ med_inc + black_perc + white_perc + pov_perc + high_school_perc + bach_perc + occupancy_perc + `SALE PRICE`,
+                data = joined_pop, 
+                family = "poisson")
+
+
+mod_pois_impairing <- glm(count ~ med_inc + black_perc + white_perc + pov_perc + high_school_perc + bach_perc + occupancy_perc + `SALE PRICE`,
+                data = joined_pop_impairing, 
+                family = "poisson")
+
+# Plot the model
+par(mfrow=c(2,2))
+# plot(mod_pois)
+plot(mod_pois_impairing)
+```
+
+```{r}
+options(scipen = 999)
+summary(mod_pois)
+```
+
+A poisson model reveals more potential correlations: median income as a significant variable for negative relationship with violation counts. Black pecentage, white percentage and occupancy also have a significant negative relationship with violation counts, although with slightly larger standard errors. Poverty rate has a very high negative impact on violation counts, shown in the -2.4 estimate. Additionally, sale price is negatively related with counts, although it is less significant compared to the other variables. 
+
+```{r}
+summary(mod_pois_impairing)
+```
+
+```{r}
+joined_sales <- merge(py$violation_count, py$sales, by.x = "CensusTract", by.y = "Census Tract 2020", all.x = FALSE)
+
+# Create a linear model
+mod_sales <- lm(count ~ `SALE PRICE`, data = joined_sales)
+par(mfrow=c(2,2))
+# plot(mod_pois)
+plot(mod_sales)
+summary(mod_sales)
+```
