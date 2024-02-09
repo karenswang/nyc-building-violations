@@ -1,0 +1,378 @@
+## Preparing the data
+```{python}
+from pyspark.sql import SparkSession
+spark.stop()
+
+spark = SparkSession.builder \
+    .appName("new session") \
+    .getOrCreate()
+
+```
+
+1. property tax exemptions (rent-incentive exemption, j-51, 421a, 420g, Article IX)
+```{python}
+from pyspark.sql.functions import max
+exemptions = spark.read.csv("data/exemptions.csv", header=True, inferSchema=True)
+exemptions = exemptions.filter(exemptions["YEAR"] > 2016)
+exemptions = exemptions.filter((exemptions["PARID"].isNotNull()) & (exemptions["PARID"] != 0))
+exemptions = exemptions.filter((exemptions["CUREXMPTOT"].isNotNull()) & (exemptions["CUREXMPTOT"] != 0))
+exemptions_rent = exemptions.filter((exemptions["NYS_EXMP_CODE"].isin(["48806", "48076", "48070", "48820", "48826", "48746"]))) 
+exemptions_rent_bbl = exemptions_rent.groupBy("PARID").agg(max("CUREXMPTOT").alias("max_exemption_rent")).withColumnRenamed("PARID", "BBL")
+# exemptions = exemptions.filter((exemptions["NYS_EXMP_CODE"].isin(["48806"]))) 421a only
+
+exemptions_bbl = exemptions.groupBy("PARID").agg(max("CUREXMPTOT").alias("max_exemption")).withColumnRenamed("PARID", "BBL")
+
+exemptions_bbl.show()
+exemptions_rent_bbl.show()
+```
+
+
+2. Housing maintenance violations (HPD violations), and
+3. Building sale prices
+```{python}
+# get violations count data, join with sales data
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import to_date, median, col
+import pandas as pd
+
+
+violations = spark.read.csv("data/building_violation_complete.csv", header=True, inferSchema=True)
+# year 
+violations = violations.withColumn("InspectionDate", to_date(violations["InspectionDate"], "MM/dd/yyyy"))
+violations_2016 = violations.filter(violations["InspectionDate"] > "2015-12-31")
+
+#by bbl
+violations_bbl = violations_2016.filter(violations["BBL"].isNotNull() & (violations["BBL"] != 0))
+violations_bbl = violations_bbl.groupBy("BBL").count()
+
+#by census tract
+violations_tract = violations_2016.filter(violations["CensusTract"].isNotNull())
+violations_tract = violations_tract.groupBy("CensusTract").count()
+
+sale_price = spark.read.csv("data/building_sales_raw.csv", header=True, inferSchema=True)
+# by bbl
+# Remove records where BBL/sale price is null or 0
+sale_price_bbl = sale_price.filter((sale_price["BBL"].isNotNull()) & (sale_price["BBL"] != 0) & (sale_price["SALE PRICE"].isNotNull()) & (sale_price["SALE PRICE"] > 100))
+sale_price_bbl = sale_price_bbl.groupBy("BBL").agg(median("SALE PRICE").alias("median_sale_price"))
+
+# by tract
+# Remove records where CensusTract/sale price is null or 0
+sale_price_tract = sale_price.filter(sale_price["Census Tract"].isNotNull() & (sale_price["SALE PRICE"].isNotNull()) & (sale_price["SALE PRICE"] != 0))
+sale_price_tract = sale_price_tract.groupBy("Census Tract").agg(median("SALE PRICE").alias("median_sale_price"))
+
+
+violation_sales_bbl = violations_bbl.join(sale_price_bbl, on="BBL", how="outer")
+violation_sales_tract = violations_tract.join(sale_price_tract, violations_tract["CensusTract"] == sale_price_tract["Census Tract"], how="outer")
+violation_sales_bbl.show()
+violation_sales_tract.show()
+# violation_sales_bbl = violation_sales_bbl.toPandas()
+violation_sales_tract = violation_sales_tract.toPandas()
+
+```
+
+4. Evictions
+```{python}
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, when
+import pandas as pd
+
+
+evictions = spark.read.csv("data/evictions.csv", header=True, inferSchema=True)
+
+evictions_bbl = evictions.filter(evictions["BBL"].isNotNull() & (evictions["BBL"] != 0))
+evictions_bbl = evictions_bbl.groupBy("BBL").count().select(col("BBL"), col("count").alias("eviction_count"))
+evictions_bbl = evictions_bbl.withColumn("has_eviction", when(evictions_bbl["eviction_count"] > 0, 1).otherwise(0))
+
+
+evictions_tract = evictions.filter(evictions["Census Tract"].isNotNull())
+evictions_tract = evictions_tract.groupBy("Census Tract").count().select(col("Census Tract"), col("count").alias("eviction_count"))
+evictions_tract = evictions_tract.withColumn("has_eviction", when(evictions_tract["eviction_count"] > 0, 1).otherwise(0))
+
+
+evictions_bbl.show()
+evictions_tract.show()
+evictions_tract = evictions_tract.toPandas()
+
+# violation_evictions_bbl = violations_bbl.join(evictions_bbl, on="BBL", how="inner")
+# violation_evictions_tract = violations_tract.join(evictions_tract, violations_tract["CensusTract"] == evictions_tract["Census Tract"], how="inner")
+
+# violation_evictions_bbl.show()
+# violation_evictions_tract.show()
+# violation_evictions_bbl = violation_evictions_bbl.toPandas()
+# violation_evictions_tract = violation_evictions_tract.toPandas()
+
+
+
+# spark.stop()
+```
+
+5. City discretionary funding (too little to be included in the data)
+```{python}
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import to_date
+import pandas as pd
+
+# spark = SparkSession.builder \
+#     .appName("Funding data") \
+#     .getOrCreate()
+
+funding = spark.read.csv("data/funding.csv", header=True, inferSchema=True)
+funding = funding.filter(funding["Amount ($)"] > 0)
+funding = funding.filter(funding["Fiscal Year"]>2016)
+funding = funding.filter(funding["BBL"].isNotNull() & (funding["BBL"] != 0))
+#convert amount to numeric
+funding = funding.withColumn("Amount ($)", funding["Amount ($)"].cast("float"))
+funding_bbl = funding.groupBy("BBL").sum("Amount ($)").select(col("BBL"), col("sum(Amount ($))").alias("funding_amount"))
+funding_bbl.show()
+
+
+```
+
+6. Affordable housing units (too little to be included in the data)
+```{python}
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import to_date, sum, col
+import pandas as pd
+
+
+affordable_housing = spark.read.csv("data/affordable_housing.csv", header=True, inferSchema=True)
+# affordable_housing = affordable_housing.filter(affordable_housing["Project Start Date"] > "01/01/2016")
+
+affordable_housing_bbl = affordable_housing.filter(affordable_housing["BBL"].isNotNull() & (affordable_housing["BBL"] != 0))
+
+# Continue from your affordable_housing_bbl definition
+# Group by "BBL" and aggregate
+affordable_housing_bbl = affordable_housing_bbl.groupBy("BBL").agg(
+    sum("Total Units").alias("affordable_housing_count"),  # Aggregate the "Total Units"
+    (sum("Extremely Low Income Units") +                   # Sum the specified income units
+     sum("Very Low Income Units") +
+     sum("Low Income Units")).alias("affordable_housing_low_income_count")
+)
+
+affordable_housing_bbl.show()
+```
+
+Join the tables
+```{python}
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+
+
+# Assuming affordable_housing_bbl, funding_bbl, evictions_bbl, and violation_sales_bbl have been defined as per the provided scripts
+
+# Perform the joins
+combined_data_bbl = evictions_bbl.join(funding_bbl, on="BBL", how="outer") \
+                                          .join(affordable_housing_bbl, on="BBL", how="outer") \
+                                          .join(violation_sales_bbl, on="BBL", how="outer") \
+                                            .join(exemptions_rent_bbl, on="BBL", how="outer") \
+                                          .join(exemptions_bbl, on="BBL", how="outer")
+
+# Display the combined DataFrame
+combined_data_bbl.show()
+
+# Convert to Pandas DataFrame for further analysis or export
+combined_data_bbl = combined_data_bbl.toPandas()
+
+# Optionally, save the combined data to a CSV file
+combined_data_bbl.to_csv("combined_data_bbl.csv", index=False)
+
+```
+
+```{python}
+import pandas as pd
+combined_data_bbl = pd.read_csv("combined_data_bbl_rm_outlier.csv")
+# combined_data_bbl["has_exemption"] = combined_data_bbl["max_exemption"].notnull().astype(int)
+
+combined_data_bbl.isnull().mean()
+# combined_data_bbl = combined_data_bbl.fillna(0)
+
+```
+
+
+## Analysis
+### Boro-block-lot (BBL) level: median exemption ~ eviction count, median sale price, count of violations
+Question: would more expensive buildings with more evictions and violations receive more exemption?
+
+_Modeling question: adding/removing affordable housing count would change the sign of eviction count. How to best model this?_
+```{r}
+library(tidyverse)
+library(reticulate)
+bbl_p <- glm(max_exemption ~ eviction_count + median_sale_price + count, data = py$combined_data_bbl, family = "poisson")
+
+# Ensure the MASS package is installed and loaded
+if (!requireNamespace("MASS", quietly = FALSE)) install.packages("MASS")
+library(MASS)
+
+# Fitting a negative binomial model
+bbl <- glm.nb(max_exemption ~ eviction_count + median_sale_price + count,
+              data = py$combined_data_bbl)
+# bbl_log <- glm(has_exemption ~ eviction_count + median_sale_price + count, 
+#               data = py$combined_data_bbl_pd, family = "binomial")
+
+
+par(mfrow=c(2,2))
+plot(bbl)
+
+options(scipen = 999)
+summary(bbl)
+```
+
+
+get acs demographic data
+```{r}
+library(tidyverse)
+library(tidycensus)
+
+# Define a function that gets ACS data for a given county
+get_acs_data <- function(county) {
+  data <- get_acs(geography = "tract", 
+          state = "NY",
+          county = county, 
+          variables = c(
+            med_inc = "B19013_001",
+            white = "B02001_002", 
+            black = "B02001_003", 
+            asian = "B02001_005",
+            hispanic = "B03003_003",
+            poverty = "B17001_002",
+            education_high_school = "B15003_017",
+            education_bachelor = "B15003_022",
+            occupancy = "B25002_002"
+          , year = 2021),
+          summary_var = "B01003_001"
+  ) %>% 
+    dplyr::select(-moe, -summary_moe) %>% 
+    pivot_wider(names_from = "variable", values_from = "estimate")%>% 
+    mutate(black_perc = black / summary_est,
+                 white_perc = white / summary_est,
+                 asian_perc = asian / summary_est,
+                 hispanic_perc = hispanic / summary_est,
+                 pov_perc = poverty / summary_est,
+                 high_school_perc = education_high_school / summary_est,
+                 bach_perc = education_bachelor / summary_est,
+                 occupancy_perc = occupancy / summary_est,
+                 CensusTract = as.numeric(gsub("\\.", "", str_extract(NAME, "\\d+(\\.\\d+)?")))
+                 ) %>%
+    filter(!is.null(summary_est) & summary_est != 0)
+  
+  # Print the head of the data
+  print(head(data))
+  
+  # Return the data
+  return(data)
+}
+
+# List of counties
+counties <- c("new york", "bronx", "kings", "queens", "richmond")
+
+# Get ACS data for all counties
+tract_data_list <- lapply(counties, get_acs_data)
+
+# Combine all data into one DataFrame
+demo_tract <- bind_rows(tract_data_list)
+
+# write.csv(demo_tract, "demo_tract.csv")
+
+```
+```{python}
+import pandas as pd
+demo_tract = pd.DataFrame(r.demo_tract)
+```
+
+### Tract level: evictions ~ median income, Black, white, Asian, Hispanic, poverty, housing occupancy, violation counts
+Question: how is eviction rate related to race, income and housing price and housing conditions?
+My hypothesis: exemption is more likely to motivate rent increase (no data on this), which leads to eviction. 
+
+_Modeling question: removing Asian or hispanic would bring Black from negative to positive. This could mean that racial data is interrelated? How to best model this?_
+```{r}
+library(tidyverse)
+library(reticulate)
+library(reticulate)
+# Rename the column in the right data frame
+names(py$demo_tract)[names(py$demo_tract) == "CensusTract"] <- "Census Tract"
+
+# Merge the data frames
+joined_tract <- merge(py$evictions_tract, py$demo_tract, by = "Census Tract")
+
+
+joined_tract <- merge(joined_tract, py$violation_sales_tract, by = "Census Tract")
+
+# print(head(joined_tract))
+# Ensure the MASS package is installed and loaded
+# if (!requireNamespace("MASS", quietly = TRUE)) install.packages("MASS")
+# library(MASS)
+
+# Fitting a negative binomial model
+tract <- glm(eviction_count ~ med_inc + black_perc + white_perc + hispanic_perc + pov_perc + occupancy_perc + median_sale_price + count, 
+              data = joined_tract, family = "poisson")
+# tract_log <- glm(has_eviction ~ med_inc + black_perc + white_perc + pov_perc + high_school_perc + bach_perc + occupancy_perc, 
+#               data = joined_tract, family = "binomial")
+
+par(mfrow=c(2,2))
+plot(tract)
+
+options(scipen = 999)
+summary(tract)
+
+
+```
+
+Other questions:
+1. how to best use when large portion of the data is null?
+2. how to best model time series data?
+
+```{python}
+combined_data_bbl = pd.read_csv("combined_data_bbl_rm_outlier.csv")
+
+
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# Assuming df is your DataFrame
+# Columns in your DataFrame excluding 'eviction_count'
+columns = ["funding_amount", "affordable_housing_count",
+           "affordable_housing_low_income_count", "count",
+           "median_sale_price", "max_exemption"]
+
+# Number of rows and columns for the subplot grid
+nrows = 3  # Adjust based on your needs
+ncols = 3  # Adjust based on your needs
+
+# Create a figure and a grid of subplots
+fig, axes = plt.subplots(nrows, ncols, figsize=(15, 15))
+fig.tight_layout(pad=4.0)
+
+# Flatten the axes array for easy iteration
+axes_flat = axes.flatten()
+
+# Iterate over the columns and their corresponding axes in the flattened array
+for i, col in enumerate(columns):
+    ax = axes_flat[i]
+    ax.scatter(combined_data_bbl["eviction_count"], combined_data_bbl[col], alpha=0.5)
+    ax.set_title(f'Eviction Count vs {col}')
+    ax.set_xlabel('Eviction Count')
+    ax.set_ylabel(col)
+
+# Hide any unused subplot areas (if your number of plots is less than nrows*ncols)
+for ax in axes_flat[i+1:]:
+    ax.set_visible(False)
+
+plt.show()
+
+
+```
+
+```{python}
+import pandas as pd
+combined_data_bbl = pd.read_csv("combined_data_bbl.csv")
+
+# Assuming df is your DataFrame and 'evictions' is the column with eviction numbers
+combined_data_bbl = combined_data_bbl.dropna(subset=['eviction_count'])
+total_records = len(combined_data_bbl)
+records_under_20 = sum(combined_data_bbl['eviction_count'] < 5)
+
+percentage = (records_under_20 / total_records) * 100
+
+print(f"The percentage of records with evictions number under 20 is {percentage}%")
+```
